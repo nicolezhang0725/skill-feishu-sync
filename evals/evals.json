@@ -1,0 +1,29 @@
+{
+  "skill_name": "feishu-sync",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我想把本地 markdown 文件同步到飞书，但我从来没配置过。帮我设置一下。我的飞书知识库空间 ID 是 7617846903966862541。",
+      "expected_output": "Claude guides the user through onboarding: verifies lark-cli, asks for readme_title if needed, creates a minimal lark-sync.json with only space_id, and runs init.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "把飞书上的最新内容拉取到本地，覆盖我现在的 markdown 文件。",
+      "expected_output": "Claude runs the pull command and reports which files were updated, handling any Lark-specific formatting cleanup.",
+      "files": ["lark-sync.json", "sync_state.json"]
+    },
+    {
+      "id": 3,
+      "prompt": "我修改了本地的几个章节，现在要把它们推送到飞书 wiki 上。",
+      "expected_output": "Claude runs the push command, overwriting the corresponding Feishu documents, and reports success/failure per file.",
+      "files": ["lark-sync.json", "sync_state.json"]
+    },
+    {
+      "id": 4,
+      "prompt": "帮我看看现在本地和飞书的同步状态，有哪些文件还没对应上？",
+      "expected_output": "Claude runs the status command and presents a clear summary of matched, unmatched, and orphaned files.",
+      "files": ["lark-sync.json", "sync_state.json"]
+    }
+  ]
+}
