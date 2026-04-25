@@ -170,12 +170,88 @@ def unescape_lark_markdown(content: str) -> str:
 
 # --- Commands ---
 
+def fetch_all_nodes(space_id: str, parent_token: Optional[str] = None, current_path: str = "") -> Dict[str, dict]:
+    """Recursively fetch all nodes from a Wiki space to build the sync state."""
+    state = {}
+    params = {"space_id": space_id}
+    if parent_token:
+        params["parent_node_token"] = parent_token
+    
+    res = run_cmd([
+        "lark-cli", "wiki", "nodes", "list", 
+        "--params", json.dumps(params)
+    ])
+    
+    if res.returncode != 0:
+        return state
+    
+    try:
+        data = json.loads(res.stdout)
+    except:
+        return state
+        
+    items = data.get("data", {}).get("items", [])
+    
+    for item in items:
+        # Sanitize title for filename
+        title = re.sub(r'[\\/*?:"<>|]', "_", item["title"])
+        has_child = item.get("has_child")
+        
+        if not parent_token:
+            # Root level nodes
+            if has_child:
+                rel_path = f"{title}/{title}.md"
+            else:
+                rel_path = f"{title}.md"
+            
+            state[rel_path] = {
+                "node_token": item["node_token"],
+                "obj_token": item["obj_token"]
+            }
+            if has_child:
+                state.update(fetch_all_nodes(space_id, item["node_token"], title))
+        else:
+            # Sub-nodes
+            if has_child:
+                rel_path = f"{current_path}/{title}/{title}.md"
+            else:
+                rel_path = f"{current_path}/{title}.md"
+                
+            state[rel_path] = {
+                "node_token": item["node_token"],
+                "obj_token": item["obj_token"]
+            }
+            if has_child:
+                state.update(fetch_all_nodes(space_id, item["node_token"], f"{current_path}/{title}"))
+    return state
+
+def cmd_init(config: dict) -> None:
+    """Initialize or refresh the sync state by crawling the remote Wiki space."""
+    space_id = config.get("space_id")
+    if not space_id:
+        print_error("space_id not found in lark-sync.json")
+        return
+        
+    print_info(f"Crawling Wiki space {space_id} to discover nodes...")
+    new_state = fetch_all_nodes(space_id)
+    
+    if not new_state:
+        print_error("No nodes found or failed to fetch nodes.")
+        return
+        
+    state_path = Path(config["state_file"])
+    save_state(state_path, new_state)
+    print_success(f"Sync state initialized/refreshed with {len(new_state)} nodes.")
+    print_info("Run 'pull' to download content for any new nodes.")
+
 def cmd_pull(config: dict) -> None:
     state_path = Path(config["state_file"])
     state = load_state(state_path)
     if not state:
-        print_error("No sync state found. Run 'init' first.")
-        return
+        print_warning("No sync state found. Attempting to initialize...")
+        cmd_init(config)
+        state = load_state(state_path)
+        if not state: return
 
     for rel_path, info in state.items():
         obj_token = info["obj_token"]
@@ -413,7 +489,7 @@ def cmd_push(config: dict, strategy: str, target: Optional[str] = None) -> None:
         if confirm != "yes":
             print_info("Aborted.")
             return
-        _push_overwrite(state)
+        _push_overwrite(state, config)
     
     elif strategy == "patch":
         _push_patch(state, config)
@@ -425,23 +501,53 @@ def cmd_push(config: dict, strategy: str, target: Optional[str] = None) -> None:
         print_error(f"Unknown strategy: {strategy}")
         print_info("Available: overwrite, patch, str_replace")
 
-def _push_overwrite(state: dict) -> None:
+def _push_overwrite(state: dict, config: dict) -> None:
+    import json
+    domain = config.get("domain", DEFAULT_DOMAIN)
+    space_id = config.get("space_id")
     for rel_path, info in state.items():
         if not Path(rel_path).exists():
             continue
         obj_token = info["obj_token"]
         print(f"  Overwriting {rel_path}...", end=" ", flush=True)
         
+        # --- NEW: Link Resolution ---
+        content = Path(rel_path).read_text(encoding="utf-8")
+        
+        def replace_links(match):
+            text = match.group(1)
+            link = match.group(2)
+            clean_link = link.replace("./", "")
+            for state_path, state_info in state.items():
+                if clean_link in state_path or state_path in clean_link:
+                     return f"[{text}](https://{domain}/docx/{state_info['obj_token']})"
+            return match.group(0)
+            
+        new_content = re.sub(r'\[([^\]]+)\]\(([^)]+\.md)\)', replace_links, content)
+        tmp_path = Path(rel_path).with_suffix('.tmp.md')
+        tmp_path.write_text(new_content, encoding="utf-8")
+        
         res = run_cmd([
             "lark-cli", "docs", "+update",
             "--api-version", "v2",
             "--doc", obj_token,
             "--command", "overwrite",
-            "--content", f"@{rel_path}",
+            "--content", f"@{tmp_path}",
             "--doc-format", "markdown"
         ], timeout=60)
         
+        tmp_path.unlink() # Cleanup
+        
         if res.returncode == 0:
+            # --- NEW: Anti-Untitled Title Lock ---
+            node_token = info.get("node_token")
+            if space_id and node_token:
+                new_title = Path(rel_path).stem
+                run_cmd([
+                    "lark-cli", "api", "POST",
+                    f"/open-apis/wiki/v2/spaces/{space_id}/nodes/{node_token}/update_title",
+                    "--data", json.dumps({"title": new_title})
+                ])
             print("Done!")
         else:
             print(f"Failed! {res.stderr.strip()}")
@@ -588,8 +694,7 @@ def main():
     elif args.command == "blocks":
         cmd_blocks(config, args.file)
     elif args.command in ("setup", "init"):
-        print_info("Please use 'clone' for new projects, 'pull' for existing ones.")
-        print_info("To initialize sync state from existing local files, run 'pull'.")
+        cmd_init(config)
 
 if __name__ == "__main__":
     main()
