@@ -253,6 +253,63 @@ def cmd_pull(config: dict) -> None:
         state = load_state(state_path)
         if not state: return
 
+    # --- Auto-discover new remote documents ---
+    title_to_path = {v: k for k, v in config.get("title_mappings", {}).items()}
+    all_nodes = fetch_all_wiki_nodes(config["space_id"])
+
+    discovered = 0
+    for _ in range(10):  # Prevent infinite loops
+        new_found = 0
+        node_to_path = {v["node_token"]: k for k, v in state.items()}
+
+        for node in all_nodes:
+            obj_token = node["obj_token"]
+            if obj_token in {info["obj_token"] for info in state.values()}:
+                continue
+
+            title = node["title"]
+            parent_token = node.get("parent_node_token", "")
+
+            # Try title_mappings reverse lookup
+            local_path_str = title_to_path.get(title)
+
+            # Try to infer from parent path
+            if not local_path_str and parent_token in node_to_path:
+                parent_path = Path(node_to_path[parent_token])
+                if parent_path.name.lower() == "index.md":
+                    target_dir = parent_path.parent
+                else:
+                    target_dir = parent_path.parent
+
+                # Detect phase index nodes (e.g. "第六阶段-xxx")
+                if title.startswith("第") and "阶段" in title:
+                    safe_title = re.sub(r'[\\/:*?"<>|]', "_", title)
+                    target_dir = target_dir / safe_title
+                    local_path_str = str((target_dir / "Index.md").as_posix())
+                else:
+                    safe_title = re.sub(r'[\\/:*?"<>|]', "_", title)
+                    local_path_str = str((target_dir / f"{safe_title}.md").as_posix())
+
+            if local_path_str:
+                local_path = Path(local_path_str)
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                if not local_path.exists():
+                    local_path.touch()
+
+                state[str(local_path.as_posix())] = {
+                    "node_token": node["node_token"],
+                    "obj_token": obj_token,
+                }
+                new_found += 1
+
+        discovered += new_found
+        if new_found == 0:
+            break
+
+    if discovered:
+        save_state(state_path, state)
+        print(f"Discovered {discovered} new remote document(s).\n")
+
     for rel_path, info in state.items():
         obj_token = info["obj_token"]
         print(f"  Pulling {rel_path}...", end=" ", flush=True)
