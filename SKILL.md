@@ -54,6 +54,7 @@ When this skill is activated, follow this orchestration flow:
 - **Reply to Comment**: `python3 sync.py reply <filepath> <comment_id> <message>`.
 - **Inspect Blocks**: `python3 sync.py blocks <filepath>` — Show block tree for precise editing.
 - **Position Images**: `python3 sync.py inline-images` — Upload missing local images and place Feishu image tokens directly under matching `> 图示：...` anchors.
+- **Refresh Images**: `python3 sync.py inline-images --refresh` — Re-upload changed local images and replace old Feishu image tokens at the same anchors.
 - **Verify Images**: `python3 sync.py inline-images --verify` — Check current remote image placement without changing Feishu.
 
 ---
@@ -119,6 +120,7 @@ Run:
 
 ```bash
 python3 ~/.claude/skills/feishu-sync/scripts/sync.py inline-images
+python3 ~/.claude/skills/feishu-sync/scripts/sync.py inline-images --refresh
 python3 ~/.claude/skills/feishu-sync/scripts/sync.py inline-images --verify
 ```
 
@@ -129,6 +131,8 @@ What it does:
 3. Uses `lark-cli docs +media-insert` only as a staging step if the remote document does not yet have enough image tokens. This command appends images to the end of the document, so it is not the final layout.
 4. Fetches the remote Lark-flavored Markdown, removes loose image tags, reinserts each `<image token="..."/>` immediately after the matching `> 图示：...` anchor, and updates the document.
 5. Verifies that every image appears after its matching anchor and before the next `图示：` anchor.
+
+Use `--refresh` when the local image file changed, for example when replacing oversized desktop diagrams with mobile-safe diagrams. The command uploads fresh images first and uses the newest tokens for final placement.
 
 Why not directly create a new image block and reuse the old token? Feishu Docx Block API can create image blocks (`block_type: 27`), but a token uploaded for one image block may fail when reused in another block with `1770013 relation mismatch`. The safer flow is to stage the image inside the target document first, then reposition the document-scoped image token.
 
@@ -245,6 +249,7 @@ python3 ~/.claude/skills/feishu-sync/scripts/sync.py reply \
 | **"原文已被删除" on comments** | Used `block_replace` on a block that had comments | The block ID changed. Comment content is preserved but anchor is lost. Prefer `str_replace` if possible. |
 | **Push says "OK" but content unchanged** | `block_insert_after` may silently fail or be misordered | Run `pull` to verify, then check block tree with `blocks` command and retry. |
 | Images appear at the end of the Feishu doc | `docs +media-insert` was used directly | Run `python3 sync.py inline-images`, then `python3 sync.py inline-images --verify`. |
+| Images are in the right place but visually cropped | Old oversized image tokens are still being reused | Regenerate mobile-safe assets, then run `python3 sync.py inline-images --refresh` and verify. |
 | `inline-images` cannot find anchors | Captions in `visual_images` do not exactly match the text after `图示：` | Copy the caption from the local Markdown anchor, without the trailing explanation sentence. |
 | `inline-images` finds too few image tokens | Images were not uploaded and upload failed | Check `lark-cli doctor`, file paths in `visual_images`, and document edit permission. |
 | `1770013 relation mismatch` while replacing an image | Reusing an image token in a different image block | Use `inline-images` token repositioning instead of direct `replace_image` on a newly-created block. |

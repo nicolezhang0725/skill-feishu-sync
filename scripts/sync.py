@@ -820,7 +820,7 @@ def _image_is_after_anchor(markdown: str, caption: str) -> Tuple[bool, int]:
     )
     return ok, image_index - anchor_index
 
-def cmd_inline_images(config: dict, target: Optional[str], verify_only: bool) -> None:
+def cmd_inline_images(config: dict, target: Optional[str], verify_only: bool, refresh: bool) -> None:
     """Move Feishu image tokens directly under their Markdown 图示 anchors."""
     state_path = Path(config["state_file"])
     state = load_state(state_path)
@@ -851,6 +851,18 @@ def cmd_inline_images(config: dict, target: Optional[str], verify_only: bool) ->
 
         tags = [tag for tag in _image_tags(markdown) if tag["token"]]
         if not verify_only:
+            if refresh:
+                for spec in specs:
+                    print_info(f"Refreshing image for {rel_path}: {spec['caption']}")
+                    if not insert_doc_image(doc_id, Path(spec["image"]), spec["caption"]):
+                        failures += 1
+                        break
+                markdown = fetch_doc_markdown(doc_id)
+                if markdown is None:
+                    failures += 1
+                    continue
+                tags = [tag for tag in _image_tags(markdown) if tag["token"]]
+
             while len(tags) < len(specs):
                 next_spec = specs[len(tags)]
                 print_info(f"Uploading image for {rel_path}: {next_spec['caption']}")
@@ -875,8 +887,9 @@ def cmd_inline_images(config: dict, target: Optional[str], verify_only: bool) ->
                 failures += 0 if ok else 1
             continue
 
+        selected_tags = tags[-len(specs):] if refresh else tags[:len(specs)]
         next_markdown = re.sub(r"\n*<image token=\"[^\"]*\"[^>]*/>\n*", "\n", markdown)
-        for spec, tag in zip(specs, tags[:len(specs)]):
+        for spec, tag in zip(specs, selected_tags):
             pattern = _anchor_pattern(spec["caption"])
             if not pattern.search(next_markdown):
                 print_error(f"{rel_path}: anchor not found for {spec['caption']}")
@@ -947,6 +960,11 @@ def main():
         action="store_true",
         help="Only verify current remote image placement; do not upload or overwrite",
     )
+    inline_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Upload fresh image files and use the newest tokens for placement",
+    )
     
     # setup / init (legacy)
     subparsers.add_parser("setup", help="Alias for init")
@@ -972,7 +990,12 @@ def main():
     elif args.command == "blocks":
         cmd_blocks(config, args.file)
     elif args.command == "inline-images":
-        cmd_inline_images(config, getattr(args, "target", None), getattr(args, "verify", False))
+        cmd_inline_images(
+            config,
+            getattr(args, "target", None),
+            getattr(args, "verify", False),
+            getattr(args, "refresh", False),
+        )
     elif args.command in ("setup", "init"):
         cmd_init(config)
 
