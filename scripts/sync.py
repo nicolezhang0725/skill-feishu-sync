@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 CONFIG_NAME = "lark-sync.json"
 DEFAULT_DOMAIN = "www.feishu.cn"
@@ -53,6 +53,47 @@ def run_cmd(cmd: List[str], capture: bool = True, timeout: Optional[int] = None,
         kwargs["text"] = True
         kwargs["encoding"] = "utf-8"
     return subprocess.run(cmd, timeout=timeout, **kwargs)
+
+def fetch_doc_markdown(doc_id: str) -> Optional[str]:
+    res = run_cmd([
+        "lark-cli", "docs", "+fetch",
+        "--doc", doc_id,
+        "--format", "json",
+    ], timeout=60)
+    if res.returncode != 0:
+        print_error(f"Fetch failed: {res.stderr.strip() or res.stdout.strip()}")
+        return None
+    try:
+        return json.loads(res.stdout)["data"]["markdown"]
+    except Exception as exc:
+        print_error(f"Fetch response parse failed: {exc}")
+        return None
+
+def update_doc_markdown_overwrite(doc_id: str, markdown_file: Path) -> bool:
+    res = run_cmd([
+        "lark-cli", "docs", "+update",
+        "--doc", doc_id,
+        "--mode", "overwrite",
+        "--markdown", f"@{markdown_file.as_posix()}",
+    ], timeout=90)
+    if res.returncode != 0:
+        print_error(f"Overwrite failed: {res.stderr.strip() or res.stdout.strip()}")
+        return False
+    return True
+
+def insert_doc_image(doc_id: str, file_path: Path, caption: str) -> bool:
+    res = run_cmd([
+        "lark-cli", "docs", "+media-insert",
+        "--doc", doc_id,
+        "--file", file_path.as_posix(),
+        "--type", "image",
+        "--align", "center",
+        "--caption", caption,
+    ], timeout=120)
+    if res.returncode != 0:
+        print_error(f"Image upload failed: {res.stderr.strip() or res.stdout.strip()}")
+        return False
+    return True
 
 # --- Config & Auth ---
 
@@ -697,6 +738,174 @@ def _push_str_replace(state: dict, config: dict, target: Optional[str]) -> None:
         else:
             print("Failed!")
 
+# ---------------------------------------------------------------------------
+# NEW: Positioned image sync
+# ---------------------------------------------------------------------------
+
+def _load_visual_image_specs(config: dict, state: dict, target: Optional[str] = None) -> Dict[str, List[dict]]:
+    specs_by_file: Dict[str, List[dict]] = {}
+    configured = config.get("visual_images", [])
+
+    for item in configured:
+        rel_path = item.get("file") or item.get("path")
+        caption = item.get("caption") or item.get("anchor")
+        image = item.get("image") or item.get("file_path")
+        if not rel_path or not caption or not image:
+            print_warning(f"Skipping invalid visual_images item: {item}")
+            continue
+        if target and rel_path != target:
+            continue
+        specs_by_file.setdefault(rel_path, []).append({
+            "caption": caption,
+            "image": image,
+        })
+
+    if specs_by_file:
+        return specs_by_file
+
+    if not config.get("visual_image_autodiscover", True):
+        return specs_by_file
+
+    roots = [Path(p) for p in config.get("visual_image_dirs", ["public/course-visuals-png"])]
+    image_files: List[Path] = []
+    for root in roots:
+        if root.exists():
+            image_files.extend(sorted(
+                p for p in root.rglob("*")
+                if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+            ))
+
+    for rel_path in state:
+        if target and rel_path != target:
+            continue
+        local_file = Path(rel_path)
+        if not local_file.exists():
+            continue
+        content = local_file.read_text(encoding="utf-8")
+        anchors = re.findall(r"^>\s*图示：(.+?)(?:。|$)", content, flags=re.MULTILINE)
+        if not anchors:
+            continue
+
+        prefix_match = re.match(r"(\d+(?:\.\d+)*)", local_file.stem)
+        if not prefix_match:
+            continue
+        prefix = prefix_match.group(1)
+        candidates = [p for p in image_files if p.name.startswith(prefix)]
+        if len(candidates) < len(anchors):
+            continue
+
+        for caption, image_path in zip(anchors, candidates):
+            specs_by_file.setdefault(rel_path, []).append({
+                "caption": caption,
+                "image": image_path.as_posix(),
+            })
+
+    return specs_by_file
+
+def _image_tags(markdown: str) -> List[dict]:
+    return [
+        {"token": m.group(1), "tag": m.group(0), "index": m.start()}
+        for m in re.finditer(r'<image token="([^"]*)"[^>]*/>', markdown)
+    ]
+
+def _anchor_pattern(caption: str) -> re.Pattern:
+    return re.compile(rf"(^>\s*图示：{re.escape(caption)}[^\n]*$)", re.MULTILINE)
+
+def _image_is_after_anchor(markdown: str, caption: str) -> Tuple[bool, int]:
+    anchor_index = markdown.find(f"图示：{caption}")
+    image_index = markdown.find("<image token=", anchor_index)
+    next_anchor_index = markdown.find("图示：", anchor_index + 1)
+    ok = anchor_index >= 0 and image_index > anchor_index and (
+        next_anchor_index < 0 or image_index < next_anchor_index
+    )
+    return ok, image_index - anchor_index
+
+def cmd_inline_images(config: dict, target: Optional[str], verify_only: bool) -> None:
+    """Move Feishu image tokens directly under their Markdown 图示 anchors."""
+    state_path = Path(config["state_file"])
+    state = load_state(state_path)
+    if not state:
+        print_error("No sync state found. Run 'init' first.")
+        return
+
+    specs_by_file = _load_visual_image_specs(config, state, target)
+    if not specs_by_file:
+        print_warning("No image anchors configured or discovered.")
+        print_info("Add visual_images to lark-sync.json or enable visual_image_autodiscover.")
+        return
+
+    tmp_dir = Path(".feishu-sync-tmp") / "inline-images"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    failures = 0
+
+    for rel_path, specs in specs_by_file.items():
+        if rel_path not in state:
+            print_warning(f"Skipping unknown file: {rel_path}")
+            continue
+
+        doc_id = state[rel_path]["obj_token"]
+        markdown = fetch_doc_markdown(doc_id)
+        if markdown is None:
+            failures += 1
+            continue
+
+        tags = [tag for tag in _image_tags(markdown) if tag["token"]]
+        if not verify_only:
+            while len(tags) < len(specs):
+                next_spec = specs[len(tags)]
+                print_info(f"Uploading image for {rel_path}: {next_spec['caption']}")
+                if not insert_doc_image(doc_id, Path(next_spec["image"]), next_spec["caption"]):
+                    failures += 1
+                    break
+                markdown = fetch_doc_markdown(doc_id)
+                if markdown is None:
+                    failures += 1
+                    break
+                tags = [tag for tag in _image_tags(markdown) if tag["token"]]
+
+        if len(tags) < len(specs):
+            print_error(f"{rel_path}: expected {len(specs)} image tokens, found {len(tags)}")
+            failures += 1
+            continue
+
+        if verify_only:
+            for spec in specs:
+                ok, distance = _image_is_after_anchor(markdown, spec["caption"])
+                print(f"{'OK' if ok else 'FAIL'}\t{rel_path}\t{distance}\t{spec['caption']}")
+                failures += 0 if ok else 1
+            continue
+
+        next_markdown = re.sub(r"\n*<image token=\"[^\"]*\"[^>]*/>\n*", "\n", markdown)
+        for spec, tag in zip(specs, tags[:len(specs)]):
+            pattern = _anchor_pattern(spec["caption"])
+            if not pattern.search(next_markdown):
+                print_error(f"{rel_path}: anchor not found for {spec['caption']}")
+                failures += 1
+                continue
+            next_markdown = pattern.sub(rf"\1\n\n{tag['tag']}", next_markdown, count=1)
+
+        tmp_file = tmp_dir / rel_path.replace("/", "__")
+        tmp_file.write_text(next_markdown, encoding="utf-8")
+        print_info(f"Repositioning images in {rel_path}")
+        if not update_doc_markdown_overwrite(doc_id, tmp_file):
+            failures += 1
+            continue
+
+        verified = fetch_doc_markdown(doc_id)
+        if verified is None:
+            failures += 1
+            continue
+        for spec in specs:
+            ok, distance = _image_is_after_anchor(verified, spec["caption"])
+            print(f"{'OK' if ok else 'FAIL'}\t{rel_path}\t{distance}\t{spec['caption']}")
+            failures += 0 if ok else 1
+
+    if failures:
+        print_error(f"Inline image sync finished with {failures} failure(s).")
+        sys.exit(1)
+
+    print_success("Inline image sync verified successfully.")
+
 def main():
     parser = argparse.ArgumentParser(description="Feishu Sync Pro")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -726,6 +935,18 @@ def main():
     # blocks
     blocks_parser = subparsers.add_parser("blocks", help="Show block tree for a document")
     blocks_parser.add_argument("file", help="File path in sync state")
+
+    # inline images
+    inline_parser = subparsers.add_parser(
+        "inline-images",
+        help="Move uploaded Feishu image tokens directly under matching 图示 anchors",
+    )
+    inline_parser.add_argument("--target", help="Only process one synced file path")
+    inline_parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Only verify current remote image placement; do not upload or overwrite",
+    )
     
     # setup / init (legacy)
     subparsers.add_parser("setup", help="Alias for init")
@@ -750,6 +971,8 @@ def main():
         cmd_reply(config, args.file, args.comment_id, args.message)
     elif args.command == "blocks":
         cmd_blocks(config, args.file)
+    elif args.command == "inline-images":
+        cmd_inline_images(config, getattr(args, "target", None), getattr(args, "verify", False))
     elif args.command in ("setup", "init"):
         cmd_init(config)
 
