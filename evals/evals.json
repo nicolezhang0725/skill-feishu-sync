@@ -24,6 +24,12 @@
       "prompt": "帮我看看现在本地和飞书的同步状态，有哪些文件还没对应上？",
       "expected_output": "Claude runs the status command and presents a clear summary of matched, unmatched, and orphaned files.",
       "files": ["lark-sync.json", "sync_state.json"]
+    },
+    {
+      "id": 5,
+      "prompt": "飞书里的图片都被追加到了文末。请把本地课程图按每个 `图示：...` 锚点插回正确位置，并抽查远端结果。",
+      "expected_output": "Claude runs `python3 sync.py inline-images`, then `python3 sync.py inline-images --verify`, and reports that each image is directly after its matching anchor rather than at the end of the document. If auth, upload, or overwrite fails, Claude stops and explains the blocker instead of claiming success.",
+      "files": ["lark-sync.json", "sync_state.json", "public/course-visuals-png/"]
     }
   ]
 }
